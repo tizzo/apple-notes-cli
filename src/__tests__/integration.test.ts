@@ -35,10 +35,13 @@ async function runJson<T>(...args: string[]): Promise<T> {
   return JSON.parse(stdout) as T;
 }
 
-function requireNotes(t: TestContext) {
+/** Returns true if Notes.app is available, false (and marks test skipped) if not. */
+function requireNotes(t: TestContext): boolean {
   if (!notesAvailable) {
     t.skip("Notes.app not available or not configured");
+    return false;
   }
+  return true;
 }
 
 // Preflight: check if Notes.app responds to osascript within 10s
@@ -74,7 +77,7 @@ after(async () => {
 
 describe("integration: accounts", () => {
   it("lists accounts with expected shape", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const accounts = await runJson<unknown[]>("accounts");
     assert.ok(Array.isArray(accounts));
     assert.ok(accounts.length > 0, "should have at least one account");
@@ -89,7 +92,7 @@ describe("integration: accounts", () => {
 
 describe("integration: folders", () => {
   it("lists folders with expected shape", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const folders = await runJson<unknown[]>("folders", "list");
     assert.ok(Array.isArray(folders));
     assert.ok(folders.length > 0, "should have at least one folder");
@@ -104,7 +107,7 @@ describe("integration: folders", () => {
 
 describe("integration: list", () => {
   it("lists notes with expected shape", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const notes = await runJson<unknown[]>("list", "--limit", "2");
     assert.ok(Array.isArray(notes));
 
@@ -122,7 +125,7 @@ describe("integration: list", () => {
   });
 
   it("respects --limit", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const notes = await runJson<unknown[]>("list", "--limit", "1");
     assert.ok(notes.length <= 1);
   });
@@ -133,7 +136,7 @@ describe("integration: full CRUD cycle", () => {
   let noteId: string;
 
   it("creates a note", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const note = await runJson<Record<string, unknown>>(
       "create",
       title,
@@ -151,7 +154,7 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("shows the created note by ID", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const note = await runJson<Record<string, unknown>>("show", noteId);
     assert.equal(note.id, noteId);
     assert.equal(note.name, title);
@@ -161,13 +164,13 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("shows the created note by name", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const note = await runJson<Record<string, unknown>>("show", title);
     assert.equal(note.id, noteId);
   });
 
   it("finds the note via title search", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const results = await runJson<Array<Record<string, unknown>>>(
       "search",
       PREFIX,
@@ -178,7 +181,7 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("finds the note via content search", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const results = await runJson<Array<Record<string, unknown>>>(
       "search",
       "Integration test body",
@@ -188,7 +191,7 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("appends text to the note", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const note = await runJson<Record<string, unknown>>(
       "update",
       noteId,
@@ -200,7 +203,7 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("renames the note", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const newTitle = `${title}_renamed`;
     const note = await runJson<Record<string, unknown>>(
       "update",
@@ -213,7 +216,7 @@ describe("integration: full CRUD cycle", () => {
   });
 
   it("deletes the note", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const result = await runJson<Record<string, unknown>>("delete", noteId);
     assert.equal(result.deleted, true);
     assert.equal(result.id, noteId);
@@ -224,7 +227,7 @@ describe("integration: full CRUD cycle", () => {
 
 describe("integration: error handling", () => {
   it("returns error for non-existent note", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     try {
       await run("show", `${PREFIX}_nonexistent_note_xyz`);
       assert.fail("should have thrown");
@@ -241,7 +244,7 @@ describe("integration: error handling", () => {
 
 describe("integration: pretty format", () => {
   it("outputs human-readable text with --format pretty", async (t) => {
-    requireNotes(t);
+    if (!requireNotes(t)) return;
     const { stdout } = await run("--format", "pretty", "accounts");
     assert.throws(() => JSON.parse(stdout), "pretty output should not be JSON");
     assert.ok(stdout.length > 0);
