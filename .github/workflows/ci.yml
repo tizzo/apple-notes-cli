@@ -30,6 +30,15 @@ jobs:
         run: node dist/index.js --help
 
   integration-test:
+    # Notes.app's scripting bridge (AppleScript/JXA) data layer requires a
+    # signed-in Apple account. On GHA runners without one, app-level commands
+    # (name, activate) work, but ALL data queries (accounts, notes, folders)
+    # hang indefinitely — even after:
+    #   - Granting TCC AppleEvents permissions (SIP disabled on macos-15)
+    #   - Creating the local "On My Mac" database (auto-created on first launch)
+    #   - Dismissing the Welcome dialog and "Turn On iCloud" sheet
+    #   - Kill/relaunch cycle for clean scripting bridge state
+    # This is a fundamental Apple limitation. Tests skip gracefully via preflight.
     runs-on: macos-15
 
     steps:
@@ -44,164 +53,28 @@ jobs:
 
       - name: Setup Notes.app for CI
         run: |
-          set -euo pipefail
-
-          # Grant TCC permissions (SIP disabled on macos-15 runners)
+          # Grant osascript -> Notes.app TCC permissions (SIP disabled on macos-15)
           TIMESTAMP=$(date +%s)
-          tcc_insert() {
-            local db="$1" client="$2" sudo_prefix="${3:-}"
-            $sudo_prefix sqlite3 "$db" \
-              "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', 1, 2, 3, 1, 0, 'com.apple.Notes', $TIMESTAMP);" 2>&1 || true
-          }
           USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
           for client in /usr/bin/osascript /bin/bash /bin/zsh; do
-            tcc_insert "$USER_TCC" "$client"
-            tcc_insert "$SYS_TCC" "$client" "sudo"
+            sqlite3 "$USER_TCC" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,last_modified) VALUES('kTCCServiceAppleEvents','$client',1,2,3,1,0,'com.apple.Notes',$TIMESTAMP);" 2>/dev/null || true
+            sudo sqlite3 "$SYS_TCC" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,last_modified) VALUES('kTCCServiceAppleEvents','$client',1,2,3,1,0,'com.apple.Notes',$TIMESTAMP);" 2>/dev/null || true
           done
 
-          # Step 1: First launch to create database + "On My Mac" account
-          open -a Notes
-          sleep 3
-          killall Notes 2>/dev/null || true
-          sleep 1
-
-          # Step 2: Relaunch and dismiss both startup dialogs
-          open -a Notes
-          sleep 3
-
-          echo "Dismissing Welcome dialog..."
+          # Initialize database, dismiss startup dialogs, clean relaunch
+          open -a Notes && sleep 3 && killall Notes 2>/dev/null && sleep 1
+          open -a Notes && sleep 3
           /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events");
-            var p = se.processes.byName("Notes");
+            var se = Application("System Events"), p = se.processes.byName("Notes");
             var wins = p.windows();
             for (var i = 0; i < wins.length; i++) {
-              var buttons = wins[i].buttons();
-              for (var j = 0; j < buttons.length; j++) {
-                try { if (buttons[j].name() === "Continue") buttons[j].click(); } catch(e) {}
-              }
+              try { var bs = wins[i].buttons(); for (var j=0;j<bs.length;j++) try { if(bs[j].name()==="Continue") bs[j].click(); } catch(e){} } catch(e){}
+              try { var ss = wins[i].sheets(); for (var s=0;s<ss.length;s++) { var sb=ss[s].buttons(); for(var b=0;b<sb.length;b++) try { if(sb[b].name()!=="System Settings"){sb[b].click();break;} } catch(e){} } } catch(e){}
             }
           ' 2>/dev/null || true
-          sleep 2
-
-          echo "Dismissing Turn On iCloud sheet..."
-          /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events");
-            var p = se.processes.byName("Notes");
-            var wins = p.windows();
-            for (var i = 0; i < wins.length; i++) {
-              try {
-                var sheets = wins[i].sheets();
-                for (var s = 0; s < sheets.length; s++) {
-                  var buttons = sheets[s].buttons();
-                  for (var b = 0; b < buttons.length; b++) {
-                    try {
-                      if (buttons[b].name() !== "System Settings") {
-                        buttons[b].click();
-                        break;
-                      }
-                    } catch(e) {}
-                  }
-                }
-              } catch(e) {}
-            }
-          ' 2>/dev/null || true
-          sleep 2
-
-          # Step 3: Kill and relaunch Notes with a clean state
-          # The scripting bridge may need a fresh app process after dialogs
-          echo "Kill and relaunch for clean scripting bridge..."
-          killall Notes 2>/dev/null || true
-          sleep 2
-          open -a Notes
-          sleep 5
-
-          # Check for any new dialogs after relaunch
-          echo "UI state after fresh relaunch:"
-          /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events");
-            var p = se.processes.byName("Notes");
-            var wins = p.windows();
-            var result = [];
-            for (var i = 0; i < wins.length; i++) {
-              var w = wins[i];
-              var info = {};
-              try { info.name = w.name(); } catch(e) {}
-              try { info.sheets = w.sheets().length; } catch(e) {}
-              try {
-                info.buttons = w.buttons().map(function(b) {
-                  try { return b.name() || b.description(); } catch(e) { return "?"; }
-                });
-              } catch(e) {}
-              try {
-                info.staticTexts = w.staticTexts().slice(0,5).map(function(t) {
-                  try { return t.value(); } catch(e) { return "?"; }
-                });
-              } catch(e) {}
-              result.push(info);
-            }
-            JSON.stringify(result, null, 2);
-          ' 2>&1 || true
-
-          # Dismiss any dialogs that reappeared
-          /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events");
-            var p = se.processes.byName("Notes");
-            var wins = p.windows();
-            for (var i = 0; i < wins.length; i++) {
-              // Welcome dialog
-              try {
-                var buttons = wins[i].buttons();
-                for (var j = 0; j < buttons.length; j++) {
-                  try { if (buttons[j].name() === "Continue") buttons[j].click(); } catch(e) {}
-                }
-              } catch(e) {}
-              // iCloud sheet
-              try {
-                var sheets = wins[i].sheets();
-                for (var s = 0; s < sheets.length; s++) {
-                  var sb = sheets[s].buttons();
-                  for (var b = 0; b < sb.length; b++) {
-                    try { if (sb[b].name() !== "System Settings") { sb[b].click(); break; } } catch(e) {}
-                  }
-                }
-              } catch(e) {}
-            }
-          ' 2>/dev/null || true
-          sleep 3
-
-          # Step 4: Test data access — no screencapture to avoid permission dialogs
-          echo ""
-          echo "=== Testing data access ==="
-          /usr/bin/osascript -l JavaScript -e '
-            var app = Application("Notes");
-            JSON.stringify({ok: true, accounts: app.accounts().length});
-          ' &
-          QUERY_PID=$!
-          for i in $(seq 1 20); do
-            if ! kill -0 $QUERY_PID 2>/dev/null; then break; fi
-            sleep 1
-          done
-          if kill -0 $QUERY_PID 2>/dev/null; then
-            echo "FAILED: Data query hanging after 20s"
-            kill $QUERY_PID 2>/dev/null || true
-            wait $QUERY_PID 2>/dev/null || true
-
-            # Try AppleScript (not JXA) as a different code path
-            echo "Trying AppleScript syntax..."
-            /usr/bin/osascript -e 'tell application "Notes" to count accounts' &
-            AS_PID=$!
-            sleep 10
-            if kill -0 $AS_PID 2>/dev/null; then
-              echo "AppleScript also hangs"
-              kill $AS_PID 2>/dev/null || true
-              wait $AS_PID 2>/dev/null || true
-            else
-              wait $AS_PID && echo "AppleScript works!" || echo "AppleScript errored"
-            fi
-          else
-            wait $QUERY_PID && echo "DATA ACCESS WORKS!" || echo "Query failed (but didn't hang)"
-          fi
+          sleep 1 && killall Notes 2>/dev/null && sleep 1
+          open -a Notes && sleep 3
 
       - name: Run integration tests
         run: npm run test:integration
