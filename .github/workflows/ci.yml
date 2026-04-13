@@ -52,8 +52,6 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Grant TCC automation permissions"
-          # Grant osascript -> Notes.app AppleEvents permission
-          # Schema matches GitHub's own configure-tccdb-macos.sh format
           USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
           TIMESTAMP=$(date +%s)
@@ -61,41 +59,120 @@ jobs:
           tcc_insert() {
             local db="$1"
             local client="$2"
-            local client_type="$3"  # 0=bundle, 1=path
+            local client_type="$3"
             local target="$4"
             local sudo_prefix="${5:-}"
-
             $sudo_prefix sqlite3 "$db" \
               "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', $client_type, 2, 3, 1, 0, '$target', $TIMESTAMP);" 2>&1 || true
           }
 
-          # Try user-level TCC first (doesn't require SIP disabled)
-          echo "Attempting user-level TCC entries..."
-          tcc_insert "$USER_TCC" "/usr/bin/osascript" 1 "com.apple.Notes"
-          tcc_insert "$USER_TCC" "/bin/bash" 1 "com.apple.Notes"
-          tcc_insert "$USER_TCC" "/bin/zsh" 1 "com.apple.Notes"
+          # User-level TCC
+          for client in /usr/bin/osascript /bin/bash /bin/zsh; do
+            tcc_insert "$USER_TCC" "$client" 1 "com.apple.Notes"
+          done
+          # System-level TCC (SIP disabled on macos-15 runners)
+          for client in /usr/bin/osascript /bin/bash /bin/zsh; do
+            tcc_insert "$SYS_TCC" "$client" 1 "com.apple.Notes" "sudo"
+          done
 
-          # Try system-level TCC (requires SIP disabled)
-          echo "Attempting system-level TCC entries..."
-          tcc_insert "$SYS_TCC" "/usr/bin/osascript" 1 "com.apple.Notes" "sudo"
-          tcc_insert "$SYS_TCC" "/bin/bash" 1 "com.apple.Notes" "sudo"
-          tcc_insert "$SYS_TCC" "/bin/zsh" 1 "com.apple.Notes" "sudo"
-
-          # Verify what got written
-          echo "User TCC entries for Notes:"
-          sqlite3 "$USER_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';" 2>&1 || echo "(no entries or not readable)"
-          echo "System TCC entries for Notes:"
-          sudo sqlite3 "$SYS_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';" 2>&1 || echo "(no entries or not readable)"
+          echo "TCC entries written:"
+          sqlite3 "$USER_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';"
           echo "::endgroup::"
 
-          echo "::group::Launch Notes.app"
-          # Launch Notes and give it time to initialize
+          echo "::group::Bootstrap Notes.app"
+          # Pre-create the Notes container so Notes.app doesn't show first-run UI
+          NOTES_CONTAINER="$HOME/Library/Containers/com.apple.Notes"
+          NOTES_GROUP="$HOME/Library/Group Containers/group.com.apple.notes"
+          mkdir -p "$NOTES_CONTAINER/Data/Library/Preferences"
+          mkdir -p "$NOTES_GROUP/Library/Preferences"
+
+          # Try to suppress first-launch dialogs via defaults
+          # Write to both the container domain and the group container domain
+          defaults write com.apple.Notes hasSeenFirstLaunch -bool true 2>/dev/null || true
+          defaults write "$NOTES_GROUP/Library/Preferences/group.com.apple.notes" hasSeenFirstLaunch -bool true 2>/dev/null || true
+          defaults write "$NOTES_CONTAINER/Data/Library/Preferences/com.apple.Notes" hasSeenFirstLaunch -bool true 2>/dev/null || true
+
+          # Launch Notes.app, give it a moment, then kill it so it initializes its DB
+          echo "First launch (to initialize database)..."
+          open -a Notes
+          sleep 3
+          killall Notes 2>/dev/null || true
+          sleep 1
+
+          # Inspect what Notes created
+          echo "Notes container contents:"
+          find "$NOTES_CONTAINER" -maxdepth 3 -type f 2>/dev/null | head -20 || echo "(empty)"
+          echo "Notes group container contents:"
+          find "$NOTES_GROUP" -maxdepth 3 -type f 2>/dev/null | head -20 || echo "(empty)"
+
+          # Dump any Notes preferences we can find
+          echo "Notes preferences (container):"
+          defaults read "$NOTES_CONTAINER/Data/Library/Preferences/com.apple.Notes" 2>/dev/null || echo "(none)"
+          echo "Notes preferences (group):"
+          defaults read "$NOTES_GROUP/Library/Preferences/group.com.apple.notes" 2>/dev/null || echo "(none)"
+          echo "Notes preferences (global):"
+          defaults read com.apple.Notes 2>/dev/null || echo "(none)"
+
+          # Check if NoteStore.sqlite was created
+          NOTESTORE="$NOTES_GROUP/NoteStore.sqlite"
+          if [ -f "$NOTESTORE" ]; then
+            echo "NoteStore.sqlite exists! Tables:"
+            sqlite3 "$NOTESTORE" ".tables" 2>/dev/null || echo "(can't read)"
+            echo "Accounts in DB:"
+            sqlite3 "$NOTESTORE" "SELECT ZNAME, ZACCOUNTTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE ZNAME IS NOT NULL AND ZACCOUNTTYPE IS NOT NULL LIMIT 10;" 2>/dev/null || echo "(no account rows or different schema)"
+          else
+            echo "NoteStore.sqlite NOT created"
+          fi
+
+          # Try to use System Events to dismiss any dialog that might be showing
+          echo "Attempting to dismiss any Notes dialog via System Events..."
+          /usr/bin/osascript -l JavaScript -e '
+            var se = Application("System Events");
+            var notesProc = se.processes.byName("Notes");
+            try {
+              var windows = notesProc.windows();
+              JSON.stringify({windows: windows.length, names: windows.map(function(w) { return w.name(); })});
+            } catch(e) {
+              JSON.stringify({error: e.message});
+            }
+          ' 2>&1 || echo "(System Events query failed)"
+
+          # Try clicking buttons in any dialog
+          /usr/bin/osascript -l JavaScript -e '
+            var se = Application("System Events");
+            var notesProc = se.processes.byName("Notes");
+            try {
+              var wins = notesProc.windows();
+              for (var i = 0; i < wins.length; i++) {
+                var buttons = wins[i].buttons();
+                var btnNames = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
+                // Try to click "Not Now", "Later", "Skip", "OK", or "Continue"
+                var dismissNames = ["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel"];
+                for (var j = 0; j < buttons.length; j++) {
+                  var bname = "";
+                  try { bname = buttons[j].name(); } catch(e) { continue; }
+                  if (dismissNames.indexOf(bname) !== -1) {
+                    buttons[j].click();
+                    break;
+                  }
+                }
+              }
+              JSON.stringify({dismissed: true});
+            } catch(e) {
+              JSON.stringify({error: e.message});
+            }
+          ' 2>&1 || echo "(dialog dismiss failed)"
+
+          # Re-launch Notes.app and try the preflight again
+          echo "Re-launching Notes.app..."
+          killall Notes 2>/dev/null || true
+          sleep 1
           open -a Notes
           sleep 5
 
-          # Check if Notes responds to JXA
-          echo "Preflight check from CI setup:"
-          /usr/bin/osascript -l JavaScript -e '
+          # Final preflight check
+          echo "Preflight check:"
+          timeout 15 /usr/bin/osascript -l JavaScript -e '
             var app = Application("Notes");
             var accounts = app.accounts();
             JSON.stringify({ok: true, accounts: accounts.length});
