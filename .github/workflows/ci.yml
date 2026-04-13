@@ -30,11 +30,6 @@ jobs:
         run: node dist/index.js --help
 
   integration-test:
-    # Notes.app integration tests require macOS with a signed-in Apple account.
-    # On GHA runners (no Apple account), the scripting bridge's data layer never
-    # initializes — app.name()/activate() work but accounts/notes/folders hang.
-    # TCC permissions, Welcome dialog dismissal, and local DB creation all
-    # succeed, but it's not enough. Tests skip gracefully via preflight check.
     runs-on: macos-15
 
     steps:
@@ -47,10 +42,11 @@ jobs:
 
       - run: npm ci
 
-      - name: Setup Notes.app permissions
+      - name: Setup Notes.app for CI
         run: |
-          # Grant osascript TCC permissions for Notes.app
-          # SIP is disabled on macos-15 GHA runners
+          set -euo pipefail
+
+          # Grant TCC permissions (SIP disabled on macos-15 runners)
           TIMESTAMP=$(date +%s)
           tcc_insert() {
             local db="$1" client="$2" sudo_prefix="${3:-}"
@@ -63,16 +59,26 @@ jobs:
             tcc_insert "$USER_TCC" "$client"
             tcc_insert "$SYS_TCC" "$client" "sudo"
           done
+          # Also grant screen capture permission for screencapture tool
+          for client in /usr/sbin/screencapture /bin/bash /bin/zsh; do
+            for db in "$USER_TCC" "$SYS_TCC"; do
+              sudo_prefix=""
+              [[ "$db" == "$SYS_TCC" ]] && sudo_prefix="sudo"
+              $sudo_prefix sqlite3 "$db" \
+                "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceScreenCapture', '$client', 1, 2, 3, 1, 0, 'UNUSED', $TIMESTAMP);" 2>&1 || true
+            done
+          done
 
-          # Initialize Notes.app database (creates "On My Mac" local account)
+          # Step 1: Initialize database (first launch creates "On My Mac" account)
           open -a Notes
           sleep 3
           killall Notes 2>/dev/null || true
           sleep 1
 
-          # Dismiss first-run Welcome dialog on relaunch
+          # Step 2: Relaunch and dismiss Welcome dialog
           open -a Notes
           sleep 3
+          echo "Dismissing Welcome dialog..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
             var p = se.processes.byName("Notes");
@@ -84,59 +90,102 @@ jobs:
               }
             }
           ' 2>/dev/null || true
-          sleep 3
+          sleep 2
 
-          # Screenshot the desktop while Notes.app is running
-          mkdir -p /tmp/screenshots
-          screencapture -x /tmp/screenshots/01-after-welcome-dismiss.png
-          echo "Screenshot taken after Welcome dialog dismissal"
-
-          # Start a data query in the background (this is what hangs)
-          /usr/bin/osascript -l JavaScript -e '
-            var app = Application("Notes");
-            JSON.stringify({accounts: app.accounts().length});
-          ' &
-          QUERY_PID=$!
-          sleep 5
-
-          # Screenshot while the query is hanging
-          screencapture -x /tmp/screenshots/02-during-data-query-hang.png
-          echo "Screenshot taken during data query hang"
-
-          # Kill the hung query
-          kill $QUERY_PID 2>/dev/null || true
-          wait $QUERY_PID 2>/dev/null || true
-
-          # Also dump the full accessibility tree of the Notes window
-          echo "=== Accessibility tree of Notes window ==="
+          # Step 3: Dismiss "Turn On iCloud" sheet
+          # After Welcome, Notes shows a modal sheet asking to enable iCloud.
+          # This sheet blocks all scripting bridge data access until dismissed.
+          echo "Dismissing Turn On iCloud sheet..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
             var p = se.processes.byName("Notes");
-            function dumpElement(el, depth) {
-              if (depth > 4) return "";
-              var indent = "  ".repeat(depth);
-              var info = "";
-              try { info += el.role(); } catch(e) { info += "?"; }
-              try { var n = el.name(); if (n) info += " \"" + n + "\""; } catch(e) {}
-              try { var v = el.value(); if (v !== null && v !== undefined) info += " val=" + JSON.stringify(v).slice(0, 50); } catch(e) {}
-              try { var d = el.description(); if (d) info += " desc=\"" + d + "\""; } catch(e) {}
-              var result = indent + info + "\n";
-              try {
-                var children = el.uiElements();
-                for (var i = 0; i < children.length && i < 20; i++) {
-                  result += dumpElement(children[i], depth + 1);
-                }
-                if (children.length > 20) result += indent + "  ... (" + (children.length - 20) + " more)\n";
-              } catch(e) {}
-              return result;
-            }
             var wins = p.windows();
-            var output = "";
+            var dismissed = false;
             for (var i = 0; i < wins.length; i++) {
-              output += dumpElement(wins[i], 0);
+              // Check sheets (modal dialogs attached to windows)
+              try {
+                var sheets = wins[i].sheets();
+                for (var s = 0; s < sheets.length; s++) {
+                  var buttons = sheets[s].buttons();
+                  var names = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
+                  JSON.stringify({sheetButtons: names});
+                  // Click any dismiss-type button
+                  for (var b = 0; b < buttons.length; b++) {
+                    try {
+                      var bname = buttons[b].name();
+                      // "Not Now" or "Dismiss" or whatever the non-iCloud option is
+                      if (bname !== "System Settings") {
+                        buttons[b].click();
+                        dismissed = true;
+                        break;
+                      }
+                    } catch(e) {}
+                  }
+                  if (dismissed) break;
+                }
+              } catch(e) {}
+
+              // If no dismiss button found, try pressing Escape to close the sheet
+              if (!dismissed) {
+                try {
+                  se.keystroke(String.fromCharCode(27)); // Escape key
+                } catch(e) {}
+              }
             }
-            output;
-          ' 2>&1 || echo "(accessibility dump failed)"
+            JSON.stringify({dismissed: dismissed});
+          ' 2>&1 || true
+          sleep 2
+
+          # Take screenshot to see current state
+          mkdir -p /tmp/screenshots
+          screencapture -x /tmp/screenshots/01-after-both-dialogs.png 2>/dev/null || true
+
+          # Dump accessibility tree to check for remaining dialogs
+          echo "=== UI state after dialog dismissal ==="
+          /usr/bin/osascript -l JavaScript -e '
+            var se = Application("System Events");
+            var p = se.processes.byName("Notes");
+            var wins = p.windows();
+            var result = [];
+            for (var i = 0; i < wins.length; i++) {
+              var w = wins[i];
+              var winfo = {name: "", sheets: 0, buttons: []};
+              try { winfo.name = w.name(); } catch(e) {}
+              try { winfo.sheets = w.sheets().length; } catch(e) {}
+              try { winfo.buttons = w.buttons().map(function(b) { try { return b.name() || b.description(); } catch(e) { return "?"; } }); } catch(e) {}
+              try {
+                var sheets = w.sheets();
+                winfo.sheetButtons = [];
+                for (var s = 0; s < sheets.length; s++) {
+                  var sb = sheets[s].buttons();
+                  winfo.sheetButtons.push(sb.map(function(b) { try { return b.name(); } catch(e) { return "?"; } }));
+                }
+              } catch(e) {}
+              result.push(winfo);
+            }
+            JSON.stringify(result, null, 2);
+          ' 2>&1 || true
+
+          # Step 4: Test if data queries work now
+          echo ""
+          echo "=== Testing data access ==="
+          /usr/bin/osascript -l JavaScript -e '
+            var app = Application("Notes");
+            JSON.stringify({ok: true, accounts: app.accounts().length});
+          ' &
+          QUERY_PID=$!
+          for i in $(seq 1 15); do
+            if ! kill -0 $QUERY_PID 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 $QUERY_PID 2>/dev/null; then
+            echo "Data query still hanging after 15s"
+            screencapture -x /tmp/screenshots/02-still-hanging.png 2>/dev/null || true
+            kill $QUERY_PID 2>/dev/null || true
+            wait $QUERY_PID 2>/dev/null || true
+          else
+            wait $QUERY_PID && echo "DATA ACCESS WORKS!" || echo "Query failed (but didn't hang)"
+          fi
 
       - name: Run integration tests
         run: npm run test:integration
