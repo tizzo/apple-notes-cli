@@ -1,11 +1,11 @@
 /**
  * Integration tests that call real Notes.app via osascript.
- * Requires macOS with Notes.app available and a configured account.
+ * Requires macOS with Notes.app available and a signed-in Apple account.
  * Run separately from unit tests: npm run test:integration
  *
- * On CI (GHA macOS runners), Notes.app has no iCloud account and
- * hangs on first-run dialogs. A preflight check detects this and
- * skips all tests gracefully.
+ * On CI (GHA macOS runners), Notes.app's scripting bridge data layer
+ * (NSPersistentCloudKitContainer) hangs indefinitely without an Apple
+ * account. A preflight check detects this and skips all tests gracefully.
  */
 import { describe, it, after, before, type TestContext } from "node:test";
 import assert from "node:assert/strict";

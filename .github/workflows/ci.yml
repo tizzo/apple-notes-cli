@@ -30,16 +30,13 @@ jobs:
         run: node dist/index.js --help
 
   integration-test:
-    # Notes.app's scripting bridge (AppleScript/JXA) data layer requires a
-    # signed-in Apple account. On GHA runners without one, app-level commands
-    # (name, activate) work, but ALL data queries (accounts, notes, folders)
-    # hang indefinitely — even after:
-    #   - Granting TCC AppleEvents permissions (SIP disabled on macos-15)
-    #   - Creating the local "On My Mac" database (auto-created on first launch)
-    #   - Dismissing the Welcome dialog and "Turn On iCloud" sheet
-    #   - Kill/relaunch cycle for clean scripting bridge state
-    # This is a fundamental Apple limitation. Tests skip gracefully via preflight.
-    runs-on: macos-15
+    # Notes.app's scripting bridge data layer (NSPersistentCloudKitContainer)
+    # requires a signed-in Apple account. On GHA runners without one, app-level
+    # commands (name, activate) work but ALL data queries (accounts, notes,
+    # folders) hang indefinitely. This is a known Apple limitation — TCC
+    # permissions, dialog dismissal, and local DB creation don't help.
+    # Tests skip gracefully via preflight check; the help-all test still runs.
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v5
@@ -51,30 +48,4 @@ jobs:
 
       - run: npm ci
 
-      - name: Setup Notes.app for CI
-        run: |
-          # Grant osascript -> Notes.app TCC permissions (SIP disabled on macos-15)
-          TIMESTAMP=$(date +%s)
-          USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-          SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
-          for client in /usr/bin/osascript /bin/bash /bin/zsh; do
-            sqlite3 "$USER_TCC" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,last_modified) VALUES('kTCCServiceAppleEvents','$client',1,2,3,1,0,'com.apple.Notes',$TIMESTAMP);" 2>/dev/null || true
-            sudo sqlite3 "$SYS_TCC" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,last_modified) VALUES('kTCCServiceAppleEvents','$client',1,2,3,1,0,'com.apple.Notes',$TIMESTAMP);" 2>/dev/null || true
-          done
-
-          # Initialize database, dismiss startup dialogs, clean relaunch
-          open -a Notes && sleep 3 && killall Notes 2>/dev/null && sleep 1
-          open -a Notes && sleep 3
-          /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events"), p = se.processes.byName("Notes");
-            var wins = p.windows();
-            for (var i = 0; i < wins.length; i++) {
-              try { var bs = wins[i].buttons(); for (var j=0;j<bs.length;j++) try { if(bs[j].name()==="Continue") bs[j].click(); } catch(e){} } catch(e){}
-              try { var ss = wins[i].sheets(); for (var s=0;s<ss.length;s++) { var sb=ss[s].buttons(); for(var b=0;b<sb.length;b++) try { if(sb[b].name()!=="System Settings"){sb[b].click();break;} } catch(e){} } } catch(e){}
-            }
-          ' 2>/dev/null || true
-          sleep 1 && killall Notes 2>/dev/null && sleep 1
-          open -a Notes && sleep 3
-
-      - name: Run integration tests
-        run: npm run test:integration
+      - run: npm run test:integration
