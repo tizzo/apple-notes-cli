@@ -30,7 +30,7 @@ jobs:
         run: node dist/index.js --help
 
   integration-test:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v5
@@ -42,4 +42,65 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run test:integration
+      - name: Setup Notes.app for CI
+        run: |
+          set -euo pipefail
+
+          echo "::group::Environment info"
+          sw_vers
+          csrutil status || true
+          echo "::endgroup::"
+
+          echo "::group::Grant TCC automation permissions"
+          # Grant osascript -> Notes.app AppleEvents permission
+          # Schema matches GitHub's own configure-tccdb-macos.sh format
+          USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
+          TIMESTAMP=$(date +%s)
+
+          tcc_insert() {
+            local db="$1"
+            local client="$2"
+            local client_type="$3"  # 0=bundle, 1=path
+            local target="$4"
+            local sudo_prefix="${5:-}"
+
+            $sudo_prefix sqlite3 "$db" \
+              "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', $client_type, 2, 3, 1, 0, '$target', $TIMESTAMP);" 2>&1 || true
+          }
+
+          # Try user-level TCC first (doesn't require SIP disabled)
+          echo "Attempting user-level TCC entries..."
+          tcc_insert "$USER_TCC" "/usr/bin/osascript" 1 "com.apple.Notes"
+          tcc_insert "$USER_TCC" "/bin/bash" 1 "com.apple.Notes"
+          tcc_insert "$USER_TCC" "/bin/zsh" 1 "com.apple.Notes"
+
+          # Try system-level TCC (requires SIP disabled)
+          echo "Attempting system-level TCC entries..."
+          tcc_insert "$SYS_TCC" "/usr/bin/osascript" 1 "com.apple.Notes" "sudo"
+          tcc_insert "$SYS_TCC" "/bin/bash" 1 "com.apple.Notes" "sudo"
+          tcc_insert "$SYS_TCC" "/bin/zsh" 1 "com.apple.Notes" "sudo"
+
+          # Verify what got written
+          echo "User TCC entries for Notes:"
+          sqlite3 "$USER_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';" 2>&1 || echo "(no entries or not readable)"
+          echo "System TCC entries for Notes:"
+          sudo sqlite3 "$SYS_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';" 2>&1 || echo "(no entries or not readable)"
+          echo "::endgroup::"
+
+          echo "::group::Launch Notes.app"
+          # Launch Notes and give it time to initialize
+          open -a Notes
+          sleep 5
+
+          # Check if Notes responds to JXA
+          echo "Preflight check from CI setup:"
+          /usr/bin/osascript -l JavaScript -e '
+            var app = Application("Notes");
+            var accounts = app.accounts();
+            JSON.stringify({ok: true, accounts: accounts.length});
+          ' 2>&1 && echo "Notes.app responding!" || echo "Notes.app not responding (tests will skip gracefully)"
+          echo "::endgroup::"
+
+      - name: Run integration tests
+        run: npm run test:integration
