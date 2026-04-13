@@ -80,103 +80,164 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Bootstrap Notes.app"
-          # Pre-create the Notes container so Notes.app doesn't show first-run UI
           NOTES_CONTAINER="$HOME/Library/Containers/com.apple.Notes"
           NOTES_GROUP="$HOME/Library/Group Containers/group.com.apple.notes"
-          mkdir -p "$NOTES_CONTAINER/Data/Library/Preferences"
-          mkdir -p "$NOTES_GROUP/Library/Preferences"
 
-          # Try to suppress first-launch dialogs via defaults
-          # Write to both the container domain and the group container domain
-          defaults write com.apple.Notes hasSeenFirstLaunch -bool true 2>/dev/null || true
-          defaults write "$NOTES_GROUP/Library/Preferences/group.com.apple.notes" hasSeenFirstLaunch -bool true 2>/dev/null || true
-          defaults write "$NOTES_CONTAINER/Data/Library/Preferences/com.apple.Notes" hasSeenFirstLaunch -bool true 2>/dev/null || true
-
-          # Launch Notes.app, give it a moment, then kill it so it initializes its DB
+          # Step 1: First launch to initialize database, then kill
           echo "First launch (to initialize database)..."
           open -a Notes
           sleep 3
           killall Notes 2>/dev/null || true
-          sleep 1
+          sleep 2
 
-          # Inspect what Notes created
-          echo "Notes container contents:"
-          find "$NOTES_CONTAINER" -maxdepth 3 -type f 2>/dev/null | head -20 || echo "(empty)"
-          echo "Notes group container contents:"
-          find "$NOTES_GROUP" -maxdepth 3 -type f 2>/dev/null | head -20 || echo "(empty)"
-
-          # Dump any Notes preferences we can find
-          echo "Notes preferences (container):"
-          defaults read "$NOTES_CONTAINER/Data/Library/Preferences/com.apple.Notes" 2>/dev/null || echo "(none)"
-          echo "Notes preferences (group):"
-          defaults read "$NOTES_GROUP/Library/Preferences/group.com.apple.notes" 2>/dev/null || echo "(none)"
-          echo "Notes preferences (global):"
-          defaults read com.apple.Notes 2>/dev/null || echo "(none)"
-
-          # Check if NoteStore.sqlite was created
+          # Step 2: Verify database was created
           NOTESTORE="$NOTES_GROUP/NoteStore.sqlite"
           if [ -f "$NOTESTORE" ]; then
-            echo "NoteStore.sqlite exists! Tables:"
-            sqlite3 "$NOTESTORE" ".tables" 2>/dev/null || echo "(can't read)"
+            echo "NoteStore.sqlite exists!"
             echo "Accounts in DB:"
-            sqlite3 "$NOTESTORE" "SELECT ZNAME, ZACCOUNTTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE ZNAME IS NOT NULL AND ZACCOUNTTYPE IS NOT NULL LIMIT 10;" 2>/dev/null || echo "(no account rows or different schema)"
+            sqlite3 "$NOTESTORE" "SELECT ZNAME, ZACCOUNTTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE ZNAME IS NOT NULL AND ZACCOUNTTYPE IS NOT NULL LIMIT 10;" 2>/dev/null || echo "(none)"
           else
-            echo "NoteStore.sqlite NOT created"
+            echo "WARNING: NoteStore.sqlite NOT created"
           fi
 
-          # Try to use System Events to dismiss any dialog that might be showing
-          echo "Attempting to dismiss any Notes dialog via System Events..."
+          # Step 3: Re-launch Notes.app
+          echo "Re-launching Notes.app..."
+          open -a Notes
+          sleep 5
+
+          # Step 4: Inspect Notes windows via System Events (while Notes is running)
+          echo "Inspecting Notes UI via System Events..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
-            var notesProc = se.processes.byName("Notes");
             try {
-              var windows = notesProc.windows();
-              JSON.stringify({windows: windows.length, names: windows.map(function(w) { return w.name(); })});
+              var notesProc = se.processes.byName("Notes");
+              var wins = notesProc.windows();
+              var result = [];
+              for (var i = 0; i < wins.length; i++) {
+                var w = wins[i];
+                var winfo = {name: "", buttons: [], sheets: 0, uiElements: []};
+                try { winfo.name = w.name(); } catch(e) {}
+                try {
+                  var buttons = w.buttons();
+                  winfo.buttons = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
+                } catch(e) {}
+                try { winfo.sheets = w.sheets().length; } catch(e) {}
+                try {
+                  var uis = w.uiElements();
+                  winfo.uiElements = uis.map(function(u) {
+                    try { return u.role() + ":" + (u.name() || u.description() || ""); } catch(e) { return u.role(); }
+                  });
+                } catch(e) {}
+                result.push(winfo);
+              }
+              JSON.stringify({processExists: true, windowCount: wins.length, windows: result}, null, 2);
             } catch(e) {
-              JSON.stringify({error: e.message});
+              JSON.stringify({processExists: false, error: e.message});
             }
           ' 2>&1 || echo "(System Events query failed)"
 
-          # Try clicking buttons in any dialog
+          # Step 5: Try to dismiss any sheets/dialogs
+          echo "Attempting to dismiss any dialogs..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
-            var notesProc = se.processes.byName("Notes");
             try {
+              var notesProc = se.processes.byName("Notes");
               var wins = notesProc.windows();
+              var actions = [];
               for (var i = 0; i < wins.length; i++) {
-                var buttons = wins[i].buttons();
-                var btnNames = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
-                // Try to click "Not Now", "Later", "Skip", "OK", or "Continue"
-                var dismissNames = ["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel"];
-                for (var j = 0; j < buttons.length; j++) {
-                  var bname = "";
-                  try { bname = buttons[j].name(); } catch(e) { continue; }
-                  if (dismissNames.indexOf(bname) !== -1) {
-                    buttons[j].click();
-                    break;
+                // Check for sheets (modal dialogs attached to windows)
+                try {
+                  var sheets = wins[i].sheets();
+                  for (var s = 0; s < sheets.length; s++) {
+                    var sheetButtons = sheets[s].buttons();
+                    for (var b = 0; b < sheetButtons.length; b++) {
+                      var bname = "";
+                      try { bname = sheetButtons[b].name(); } catch(e) { continue; }
+                      actions.push("sheet-button:" + bname);
+                      if (["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel", "Close"].indexOf(bname) !== -1) {
+                        sheetButtons[b].click();
+                        actions.push("clicked:" + bname);
+                      }
+                    }
                   }
-                }
+                } catch(e) { actions.push("sheet-error:" + e.message); }
+
+                // Check window buttons
+                try {
+                  var buttons = wins[i].buttons();
+                  for (var j = 0; j < buttons.length; j++) {
+                    var bname = "";
+                    try { bname = buttons[j].name(); } catch(e) { continue; }
+                    actions.push("button:" + bname);
+                    if (["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel", "Close"].indexOf(bname) !== -1) {
+                      buttons[j].click();
+                      actions.push("clicked:" + bname);
+                    }
+                  }
+                } catch(e) { actions.push("button-error:" + e.message); }
               }
-              JSON.stringify({dismissed: true});
+              JSON.stringify({actions: actions});
             } catch(e) {
               JSON.stringify({error: e.message});
             }
           ' 2>&1 || echo "(dialog dismiss failed)"
 
-          # Re-launch Notes.app and try the preflight again
-          echo "Re-launching Notes.app..."
-          killall Notes 2>/dev/null || true
-          sleep 1
-          open -a Notes
-          sleep 5
+          sleep 2
 
-          # Final preflight check
-          echo "Preflight check:"
-          timeout 15 /usr/bin/osascript -l JavaScript -e '
+          # Step 6: Try JXA preflight with bash-native timeout (macOS has no 'timeout')
+          echo "Preflight check (15s limit):"
+          /usr/bin/osascript -l JavaScript -e '
             var app = Application("Notes");
             var accounts = app.accounts();
             JSON.stringify({ok: true, accounts: accounts.length});
-          ' 2>&1 && echo "Notes.app responding!" || echo "Notes.app not responding (tests will skip gracefully)"
+          ' &
+          OSASCRIPT_PID=$!
+          for i in $(seq 1 15); do
+            if ! kill -0 $OSASCRIPT_PID 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if kill -0 $OSASCRIPT_PID 2>/dev/null; then
+            echo "osascript timed out after 15s — Notes.app not responding to AppleEvents"
+            kill $OSASCRIPT_PID 2>/dev/null || true
+            wait $OSASCRIPT_PID 2>/dev/null || true
+
+            # Debug: check if Notes process is actually running
+            echo "Notes process info:"
+            ps aux | grep -i notes | grep -v grep || echo "(no Notes process)"
+
+            # Try a simpler AppleEvent — just activate, no data query
+            echo "Trying simple activate..."
+            /usr/bin/osascript -e 'tell application "Notes" to activate' &
+            ACTIVATE_PID=$!
+            sleep 5
+            if kill -0 $ACTIVATE_PID 2>/dev/null; then
+              echo "Even 'activate' timed out"
+              kill $ACTIVATE_PID 2>/dev/null || true
+              wait $ACTIVATE_PID 2>/dev/null || true
+            else
+              echo "'activate' succeeded, retrying data query..."
+              /usr/bin/osascript -l JavaScript -e '
+                var app = Application("Notes");
+                JSON.stringify({ok: true, accounts: app.accounts().length});
+              ' &
+              RETRY_PID=$!
+              sleep 10
+              if kill -0 $RETRY_PID 2>/dev/null; then
+                echo "Retry also timed out"
+                kill $RETRY_PID 2>/dev/null || true
+                wait $RETRY_PID 2>/dev/null || true
+              else
+                wait $RETRY_PID
+                echo "Notes.app responding after activate!"
+              fi
+            fi
+          else
+            wait $OSASCRIPT_PID && echo "Notes.app responding!" || echo "osascript failed"
+          fi
+
+          echo "Notes.app not responding — tests will skip gracefully"
           echo "::endgroup::"
 
       - name: Run integration tests
