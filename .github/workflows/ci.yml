@@ -84,6 +84,67 @@ jobs:
               }
             }
           ' 2>/dev/null || true
+          sleep 3
+
+          # Screenshot the desktop while Notes.app is running
+          mkdir -p /tmp/screenshots
+          screencapture -x /tmp/screenshots/01-after-welcome-dismiss.png
+          echo "Screenshot taken after Welcome dialog dismissal"
+
+          # Start a data query in the background (this is what hangs)
+          /usr/bin/osascript -l JavaScript -e '
+            var app = Application("Notes");
+            JSON.stringify({accounts: app.accounts().length});
+          ' &
+          QUERY_PID=$!
+          sleep 5
+
+          # Screenshot while the query is hanging
+          screencapture -x /tmp/screenshots/02-during-data-query-hang.png
+          echo "Screenshot taken during data query hang"
+
+          # Kill the hung query
+          kill $QUERY_PID 2>/dev/null || true
+          wait $QUERY_PID 2>/dev/null || true
+
+          # Also dump the full accessibility tree of the Notes window
+          echo "=== Accessibility tree of Notes window ==="
+          /usr/bin/osascript -l JavaScript -e '
+            var se = Application("System Events");
+            var p = se.processes.byName("Notes");
+            function dumpElement(el, depth) {
+              if (depth > 4) return "";
+              var indent = "  ".repeat(depth);
+              var info = "";
+              try { info += el.role(); } catch(e) { info += "?"; }
+              try { var n = el.name(); if (n) info += " \"" + n + "\""; } catch(e) {}
+              try { var v = el.value(); if (v !== null && v !== undefined) info += " val=" + JSON.stringify(v).slice(0, 50); } catch(e) {}
+              try { var d = el.description(); if (d) info += " desc=\"" + d + "\""; } catch(e) {}
+              var result = indent + info + "\n";
+              try {
+                var children = el.uiElements();
+                for (var i = 0; i < children.length && i < 20; i++) {
+                  result += dumpElement(children[i], depth + 1);
+                }
+                if (children.length > 20) result += indent + "  ... (" + (children.length - 20) + " more)\n";
+              } catch(e) {}
+              return result;
+            }
+            var wins = p.windows();
+            var output = "";
+            for (var i = 0; i < wins.length; i++) {
+              output += dumpElement(wins[i], 0);
+            }
+            output;
+          ' 2>&1 || echo "(accessibility dump failed)"
 
       - name: Run integration tests
         run: npm run test:integration
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-app-screenshots
+          path: /tmp/screenshots/
+          if-no-files-found: ignore
