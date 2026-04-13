@@ -46,198 +46,161 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "::group::Environment info"
-          sw_vers
-          csrutil status || true
-          echo "::endgroup::"
+          # Helper: run osascript with a timeout (macOS lacks GNU timeout)
+          run_with_timeout() {
+            local secs=$1; shift
+            "$@" &
+            local pid=$!
+            local i=0
+            while [ $i -lt $secs ] && kill -0 $pid 2>/dev/null; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if kill -0 $pid 2>/dev/null; then
+              kill $pid 2>/dev/null || true
+              wait $pid 2>/dev/null || true
+              return 1
+            fi
+            wait $pid
+          }
 
           echo "::group::Grant TCC automation permissions"
           USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
           TIMESTAMP=$(date +%s)
-
           tcc_insert() {
-            local db="$1"
-            local client="$2"
-            local client_type="$3"
-            local target="$4"
-            local sudo_prefix="${5:-}"
+            local db="$1" client="$2" client_type="$3" target="$4" sudo_prefix="${5:-}"
             $sudo_prefix sqlite3 "$db" \
               "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', $client_type, 2, 3, 1, 0, '$target', $TIMESTAMP);" 2>&1 || true
           }
-
-          # User-level TCC
           for client in /usr/bin/osascript /bin/bash /bin/zsh; do
             tcc_insert "$USER_TCC" "$client" 1 "com.apple.Notes"
-          done
-          # System-level TCC (SIP disabled on macos-15 runners)
-          for client in /usr/bin/osascript /bin/bash /bin/zsh; do
             tcc_insert "$SYS_TCC" "$client" 1 "com.apple.Notes" "sudo"
           done
-
-          echo "TCC entries written:"
-          sqlite3 "$USER_TCC" "SELECT client, auth_value FROM access WHERE indirect_object_identifier='com.apple.Notes';"
           echo "::endgroup::"
 
           echo "::group::Bootstrap Notes.app"
-          NOTES_CONTAINER="$HOME/Library/Containers/com.apple.Notes"
-          NOTES_GROUP="$HOME/Library/Group Containers/group.com.apple.notes"
-
-          # Step 1: First launch to initialize database, then kill
-          echo "First launch (to initialize database)..."
+          # Step 1: First launch to initialize database
+          echo "First launch..."
           open -a Notes
           sleep 3
           killall Notes 2>/dev/null || true
           sleep 2
 
-          # Step 2: Verify database was created
-          NOTESTORE="$NOTES_GROUP/NoteStore.sqlite"
-          if [ -f "$NOTESTORE" ]; then
-            echo "NoteStore.sqlite exists!"
-            echo "Accounts in DB:"
-            sqlite3 "$NOTESTORE" "SELECT ZNAME, ZACCOUNTTYPE FROM ZICCLOUDSYNCINGOBJECT WHERE ZNAME IS NOT NULL AND ZACCOUNTTYPE IS NOT NULL LIMIT 10;" 2>/dev/null || echo "(none)"
-          else
-            echo "WARNING: NoteStore.sqlite NOT created"
-          fi
-
-          # Step 3: Re-launch Notes.app
-          echo "Re-launching Notes.app..."
+          # Step 2: Re-launch and dismiss Welcome dialog
+          echo "Re-launching..."
           open -a Notes
           sleep 5
 
-          # Step 4: Inspect Notes windows via System Events (while Notes is running)
-          echo "Inspecting Notes UI via System Events..."
+          echo "Dismissing Welcome dialog..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
-            try {
-              var notesProc = se.processes.byName("Notes");
-              var wins = notesProc.windows();
-              var result = [];
-              for (var i = 0; i < wins.length; i++) {
-                var w = wins[i];
-                var winfo = {name: "", buttons: [], sheets: 0, uiElements: []};
-                try { winfo.name = w.name(); } catch(e) {}
+            var p = se.processes.byName("Notes");
+            var wins = p.windows();
+            var clicked = [];
+            for (var i = 0; i < wins.length; i++) {
+              var buttons = wins[i].buttons();
+              for (var j = 0; j < buttons.length; j++) {
                 try {
-                  var buttons = w.buttons();
-                  winfo.buttons = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
+                  var n = buttons[j].name();
+                  if (n === "Continue") { buttons[j].click(); clicked.push(n); }
                 } catch(e) {}
-                try { winfo.sheets = w.sheets().length; } catch(e) {}
-                try {
-                  var uis = w.uiElements();
-                  winfo.uiElements = uis.map(function(u) {
-                    try { return u.role() + ":" + (u.name() || u.description() || ""); } catch(e) { return u.role(); }
-                  });
-                } catch(e) {}
-                result.push(winfo);
               }
-              JSON.stringify({processExists: true, windowCount: wins.length, windows: result}, null, 2);
-            } catch(e) {
-              JSON.stringify({processExists: false, error: e.message});
             }
-          ' 2>&1 || echo "(System Events query failed)"
+            JSON.stringify(clicked);
+          ' 2>&1 || true
 
-          # Step 5: Try to dismiss any sheets/dialogs
-          echo "Attempting to dismiss any dialogs..."
+          # Give Notes time to settle after Welcome dialog
+          echo "Waiting for Notes to settle after dialog..."
+          sleep 10
+
+          # Step 3: Check if there's another dialog after Welcome
+          echo "Checking UI state after Continue..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
-            try {
-              var notesProc = se.processes.byName("Notes");
-              var wins = notesProc.windows();
-              var actions = [];
-              for (var i = 0; i < wins.length; i++) {
-                // Check for sheets (modal dialogs attached to windows)
-                try {
-                  var sheets = wins[i].sheets();
-                  for (var s = 0; s < sheets.length; s++) {
-                    var sheetButtons = sheets[s].buttons();
-                    for (var b = 0; b < sheetButtons.length; b++) {
-                      var bname = "";
-                      try { bname = sheetButtons[b].name(); } catch(e) { continue; }
-                      actions.push("sheet-button:" + bname);
-                      if (["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel", "Close"].indexOf(bname) !== -1) {
-                        sheetButtons[b].click();
-                        actions.push("clicked:" + bname);
-                      }
-                    }
-                  }
-                } catch(e) { actions.push("sheet-error:" + e.message); }
-
-                // Check window buttons
-                try {
-                  var buttons = wins[i].buttons();
-                  for (var j = 0; j < buttons.length; j++) {
-                    var bname = "";
-                    try { bname = buttons[j].name(); } catch(e) { continue; }
-                    actions.push("button:" + bname);
-                    if (["Not Now", "Later", "Skip", "OK", "Continue", "Done", "Cancel", "Close"].indexOf(bname) !== -1) {
-                      buttons[j].click();
-                      actions.push("clicked:" + bname);
-                    }
-                  }
-                } catch(e) { actions.push("button-error:" + e.message); }
-              }
-              JSON.stringify({actions: actions});
-            } catch(e) {
-              JSON.stringify({error: e.message});
+            var p = se.processes.byName("Notes");
+            var wins = p.windows();
+            var result = [];
+            for (var i = 0; i < wins.length; i++) {
+              var w = wins[i];
+              var winfo = {name: "", role: "", buttons: [], sheets: 0, groups: 0};
+              try { winfo.name = w.name(); } catch(e) {}
+              try { winfo.role = w.role(); } catch(e) {}
+              try { winfo.buttons = w.buttons().map(function(b) { try { return b.name() || b.description(); } catch(e) { return "?"; } }); } catch(e) {}
+              try { winfo.sheets = w.sheets().length; } catch(e) {}
+              try { winfo.groups = w.groups().length; } catch(e) {}
+              // Check for any static text that might indicate a dialog
+              try {
+                var texts = w.staticTexts();
+                winfo.staticTexts = texts.slice(0, 5).map(function(t) { try { return t.value(); } catch(e) { return "?"; } });
+              } catch(e) {}
+              result.push(winfo);
             }
-          ' 2>&1 || echo "(dialog dismiss failed)"
+            JSON.stringify(result, null, 2);
+          ' 2>&1 || echo "(UI query failed)"
 
-          sleep 2
+          # Step 4: Progressive JXA tests — find exactly what hangs
+          echo ""
+          echo "=== Progressive JXA tests (10s timeout each) ==="
 
-          # Step 6: Try JXA preflight with bash-native timeout (macOS has no 'timeout')
-          echo "Preflight check (15s limit):"
-          /usr/bin/osascript -l JavaScript -e '
-            var app = Application("Notes");
-            var accounts = app.accounts();
-            JSON.stringify({ok: true, accounts: accounts.length});
-          ' &
-          OSASCRIPT_PID=$!
-          for i in $(seq 1 15); do
-            if ! kill -0 $OSASCRIPT_PID 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          if kill -0 $OSASCRIPT_PID 2>/dev/null; then
-            echo "osascript timed out after 15s — Notes.app not responding to AppleEvents"
-            kill $OSASCRIPT_PID 2>/dev/null || true
-            wait $OSASCRIPT_PID 2>/dev/null || true
-
-            # Debug: check if Notes process is actually running
-            echo "Notes process info:"
-            ps aux | grep -i notes | grep -v grep || echo "(no Notes process)"
-
-            # Try a simpler AppleEvent — just activate, no data query
-            echo "Trying simple activate..."
-            /usr/bin/osascript -e 'tell application "Notes" to activate' &
-            ACTIVATE_PID=$!
-            sleep 5
-            if kill -0 $ACTIVATE_PID 2>/dev/null; then
-              echo "Even 'activate' timed out"
-              kill $ACTIVATE_PID 2>/dev/null || true
-              wait $ACTIVATE_PID 2>/dev/null || true
-            else
-              echo "'activate' succeeded, retrying data query..."
-              /usr/bin/osascript -l JavaScript -e '
-                var app = Application("Notes");
-                JSON.stringify({ok: true, accounts: app.accounts().length});
-              ' &
-              RETRY_PID=$!
-              sleep 10
-              if kill -0 $RETRY_PID 2>/dev/null; then
-                echo "Retry also timed out"
-                kill $RETRY_PID 2>/dev/null || true
-                wait $RETRY_PID 2>/dev/null || true
-              else
-                wait $RETRY_PID
-                echo "Notes.app responding after activate!"
-              fi
-            fi
+          echo -n "Test 1 - app.name(): "
+          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); app.name()'; then
+            echo "OK"
           else
-            wait $OSASCRIPT_PID && echo "Notes.app responding!" || echo "osascript failed"
+            echo "TIMEOUT"
           fi
 
-          echo "Notes.app not responding — tests will skip gracefully"
+          echo -n "Test 2 - app.running(): "
+          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.running())'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 3 - app.activate(): "
+          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); app.activate()'; then
+            echo "OK"
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 4 - count accounts (AppleScript): "
+          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to count accounts'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 5 - app.accounts.length (JXA, no parens): "
+          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.accounts.length)'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 6 - app.accounts() (JXA, full fetch): "
+          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.accounts().length)'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 7 - defaultAccount (AppleScript): "
+          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to get name of default account'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo -n "Test 8 - count notes (AppleScript): "
+          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to count notes'; then
+            echo ""
+          else
+            echo "TIMEOUT"
+          fi
+
+          echo ""
+          echo "=== End progressive tests ==="
           echo "::endgroup::"
 
       - name: Run integration tests
