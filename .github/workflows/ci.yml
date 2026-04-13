@@ -59,25 +59,17 @@ jobs:
             tcc_insert "$USER_TCC" "$client"
             tcc_insert "$SYS_TCC" "$client" "sudo"
           done
-          # Also grant screen capture permission for screencapture tool
-          for client in /usr/sbin/screencapture /bin/bash /bin/zsh; do
-            for db in "$USER_TCC" "$SYS_TCC"; do
-              sudo_prefix=""
-              [[ "$db" == "$SYS_TCC" ]] && sudo_prefix="sudo"
-              $sudo_prefix sqlite3 "$db" \
-                "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceScreenCapture', '$client', 1, 2, 3, 1, 0, 'UNUSED', $TIMESTAMP);" 2>&1 || true
-            done
-          done
 
-          # Step 1: Initialize database (first launch creates "On My Mac" account)
+          # Step 1: First launch to create database + "On My Mac" account
           open -a Notes
           sleep 3
           killall Notes 2>/dev/null || true
           sleep 1
 
-          # Step 2: Relaunch and dismiss Welcome dialog
+          # Step 2: Relaunch and dismiss both startup dialogs
           open -a Notes
           sleep 3
+
           echo "Dismissing Welcome dialog..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
@@ -92,56 +84,40 @@ jobs:
           ' 2>/dev/null || true
           sleep 2
 
-          # Step 3: Dismiss "Turn On iCloud" sheet
-          # After Welcome, Notes shows a modal sheet asking to enable iCloud.
-          # This sheet blocks all scripting bridge data access until dismissed.
           echo "Dismissing Turn On iCloud sheet..."
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
             var p = se.processes.byName("Notes");
             var wins = p.windows();
-            var dismissed = false;
             for (var i = 0; i < wins.length; i++) {
-              // Check sheets (modal dialogs attached to windows)
               try {
                 var sheets = wins[i].sheets();
                 for (var s = 0; s < sheets.length; s++) {
                   var buttons = sheets[s].buttons();
-                  var names = buttons.map(function(b) { try { return b.name(); } catch(e) { return "?"; } });
-                  JSON.stringify({sheetButtons: names});
-                  // Click any dismiss-type button
                   for (var b = 0; b < buttons.length; b++) {
                     try {
-                      var bname = buttons[b].name();
-                      // "Not Now" or "Dismiss" or whatever the non-iCloud option is
-                      if (bname !== "System Settings") {
+                      if (buttons[b].name() !== "System Settings") {
                         buttons[b].click();
-                        dismissed = true;
                         break;
                       }
                     } catch(e) {}
                   }
-                  if (dismissed) break;
                 }
               } catch(e) {}
-
-              // If no dismiss button found, try pressing Escape to close the sheet
-              if (!dismissed) {
-                try {
-                  se.keystroke(String.fromCharCode(27)); // Escape key
-                } catch(e) {}
-              }
             }
-            JSON.stringify({dismissed: dismissed});
-          ' 2>&1 || true
+          ' 2>/dev/null || true
           sleep 2
 
-          # Take screenshot to see current state
-          mkdir -p /tmp/screenshots
-          screencapture -x /tmp/screenshots/01-after-both-dialogs.png 2>/dev/null || true
+          # Step 3: Kill and relaunch Notes with a clean state
+          # The scripting bridge may need a fresh app process after dialogs
+          echo "Kill and relaunch for clean scripting bridge..."
+          killall Notes 2>/dev/null || true
+          sleep 2
+          open -a Notes
+          sleep 5
 
-          # Dump accessibility tree to check for remaining dialogs
-          echo "=== UI state after dialog dismissal ==="
+          # Check for any new dialogs after relaunch
+          echo "UI state after fresh relaunch:"
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
             var p = se.processes.byName("Notes");
@@ -149,24 +125,52 @@ jobs:
             var result = [];
             for (var i = 0; i < wins.length; i++) {
               var w = wins[i];
-              var winfo = {name: "", sheets: 0, buttons: []};
-              try { winfo.name = w.name(); } catch(e) {}
-              try { winfo.sheets = w.sheets().length; } catch(e) {}
-              try { winfo.buttons = w.buttons().map(function(b) { try { return b.name() || b.description(); } catch(e) { return "?"; } }); } catch(e) {}
+              var info = {};
+              try { info.name = w.name(); } catch(e) {}
+              try { info.sheets = w.sheets().length; } catch(e) {}
               try {
-                var sheets = w.sheets();
-                winfo.sheetButtons = [];
-                for (var s = 0; s < sheets.length; s++) {
-                  var sb = sheets[s].buttons();
-                  winfo.sheetButtons.push(sb.map(function(b) { try { return b.name(); } catch(e) { return "?"; } }));
-                }
+                info.buttons = w.buttons().map(function(b) {
+                  try { return b.name() || b.description(); } catch(e) { return "?"; }
+                });
               } catch(e) {}
-              result.push(winfo);
+              try {
+                info.staticTexts = w.staticTexts().slice(0,5).map(function(t) {
+                  try { return t.value(); } catch(e) { return "?"; }
+                });
+              } catch(e) {}
+              result.push(info);
             }
             JSON.stringify(result, null, 2);
           ' 2>&1 || true
 
-          # Step 4: Test if data queries work now
+          # Dismiss any dialogs that reappeared
+          /usr/bin/osascript -l JavaScript -e '
+            var se = Application("System Events");
+            var p = se.processes.byName("Notes");
+            var wins = p.windows();
+            for (var i = 0; i < wins.length; i++) {
+              // Welcome dialog
+              try {
+                var buttons = wins[i].buttons();
+                for (var j = 0; j < buttons.length; j++) {
+                  try { if (buttons[j].name() === "Continue") buttons[j].click(); } catch(e) {}
+                }
+              } catch(e) {}
+              // iCloud sheet
+              try {
+                var sheets = wins[i].sheets();
+                for (var s = 0; s < sheets.length; s++) {
+                  var sb = sheets[s].buttons();
+                  for (var b = 0; b < sb.length; b++) {
+                    try { if (sb[b].name() !== "System Settings") { sb[b].click(); break; } } catch(e) {}
+                  }
+                }
+              } catch(e) {}
+            }
+          ' 2>/dev/null || true
+          sleep 3
+
+          # Step 4: Test data access — no screencapture to avoid permission dialogs
           echo ""
           echo "=== Testing data access ==="
           /usr/bin/osascript -l JavaScript -e '
@@ -174,26 +178,30 @@ jobs:
             JSON.stringify({ok: true, accounts: app.accounts().length});
           ' &
           QUERY_PID=$!
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             if ! kill -0 $QUERY_PID 2>/dev/null; then break; fi
             sleep 1
           done
           if kill -0 $QUERY_PID 2>/dev/null; then
-            echo "Data query still hanging after 15s"
-            screencapture -x /tmp/screenshots/02-still-hanging.png 2>/dev/null || true
+            echo "FAILED: Data query hanging after 20s"
             kill $QUERY_PID 2>/dev/null || true
             wait $QUERY_PID 2>/dev/null || true
+
+            # Try AppleScript (not JXA) as a different code path
+            echo "Trying AppleScript syntax..."
+            /usr/bin/osascript -e 'tell application "Notes" to count accounts' &
+            AS_PID=$!
+            sleep 10
+            if kill -0 $AS_PID 2>/dev/null; then
+              echo "AppleScript also hangs"
+              kill $AS_PID 2>/dev/null || true
+              wait $AS_PID 2>/dev/null || true
+            else
+              wait $AS_PID && echo "AppleScript works!" || echo "AppleScript errored"
+            fi
           else
             wait $QUERY_PID && echo "DATA ACCESS WORKS!" || echo "Query failed (but didn't hang)"
           fi
 
       - name: Run integration tests
         run: npm run test:integration
-
-      - name: Upload screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: notes-app-screenshots
-          path: /tmp/screenshots/
-          if-no-files-found: ignore
