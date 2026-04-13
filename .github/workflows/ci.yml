@@ -30,6 +30,11 @@ jobs:
         run: node dist/index.js --help
 
   integration-test:
+    # Notes.app integration tests require macOS with a signed-in Apple account.
+    # On GHA runners (no Apple account), the scripting bridge's data layer never
+    # initializes — app.name()/activate() work but accounts/notes/folders hang.
+    # TCC permissions, Welcome dialog dismissal, and local DB creation all
+    # succeed, but it's not enough. Tests skip gracefully via preflight check.
     runs-on: macos-15
 
     steps:
@@ -42,166 +47,43 @@ jobs:
 
       - run: npm ci
 
-      - name: Setup Notes.app for CI
+      - name: Setup Notes.app permissions
         run: |
-          set -euo pipefail
-
-          # Helper: run osascript with a timeout (macOS lacks GNU timeout)
-          run_with_timeout() {
-            local secs=$1; shift
-            "$@" &
-            local pid=$!
-            local i=0
-            while [ $i -lt $secs ] && kill -0 $pid 2>/dev/null; do
-              sleep 1
-              i=$((i + 1))
-            done
-            if kill -0 $pid 2>/dev/null; then
-              kill $pid 2>/dev/null || true
-              wait $pid 2>/dev/null || true
-              return 1
-            fi
-            wait $pid
-          }
-
-          echo "::group::Grant TCC automation permissions"
-          USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-          SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
+          # Grant osascript TCC permissions for Notes.app
+          # SIP is disabled on macos-15 GHA runners
           TIMESTAMP=$(date +%s)
           tcc_insert() {
-            local db="$1" client="$2" client_type="$3" target="$4" sudo_prefix="${5:-}"
+            local db="$1" client="$2" sudo_prefix="${3:-}"
             $sudo_prefix sqlite3 "$db" \
-              "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', $client_type, 2, 3, 1, 0, '$target', $TIMESTAMP);" 2>&1 || true
+              "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier_type, indirect_object_identifier, last_modified) VALUES ('kTCCServiceAppleEvents', '$client', 1, 2, 3, 1, 0, 'com.apple.Notes', $TIMESTAMP);" 2>&1 || true
           }
+          USER_TCC="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          SYS_TCC="/Library/Application Support/com.apple.TCC/TCC.db"
           for client in /usr/bin/osascript /bin/bash /bin/zsh; do
-            tcc_insert "$USER_TCC" "$client" 1 "com.apple.Notes"
-            tcc_insert "$SYS_TCC" "$client" 1 "com.apple.Notes" "sudo"
+            tcc_insert "$USER_TCC" "$client"
+            tcc_insert "$SYS_TCC" "$client" "sudo"
           done
-          echo "::endgroup::"
 
-          echo "::group::Bootstrap Notes.app"
-          # Step 1: First launch to initialize database
-          echo "First launch..."
+          # Initialize Notes.app database (creates "On My Mac" local account)
           open -a Notes
           sleep 3
           killall Notes 2>/dev/null || true
-          sleep 2
+          sleep 1
 
-          # Step 2: Re-launch and dismiss Welcome dialog
-          echo "Re-launching..."
+          # Dismiss first-run Welcome dialog on relaunch
           open -a Notes
-          sleep 5
-
-          echo "Dismissing Welcome dialog..."
+          sleep 3
           /usr/bin/osascript -l JavaScript -e '
             var se = Application("System Events");
             var p = se.processes.byName("Notes");
             var wins = p.windows();
-            var clicked = [];
             for (var i = 0; i < wins.length; i++) {
               var buttons = wins[i].buttons();
               for (var j = 0; j < buttons.length; j++) {
-                try {
-                  var n = buttons[j].name();
-                  if (n === "Continue") { buttons[j].click(); clicked.push(n); }
-                } catch(e) {}
+                try { if (buttons[j].name() === "Continue") buttons[j].click(); } catch(e) {}
               }
             }
-            JSON.stringify(clicked);
-          ' 2>&1 || true
-
-          # Give Notes time to settle after Welcome dialog
-          echo "Waiting for Notes to settle after dialog..."
-          sleep 10
-
-          # Step 3: Check if there's another dialog after Welcome
-          echo "Checking UI state after Continue..."
-          /usr/bin/osascript -l JavaScript -e '
-            var se = Application("System Events");
-            var p = se.processes.byName("Notes");
-            var wins = p.windows();
-            var result = [];
-            for (var i = 0; i < wins.length; i++) {
-              var w = wins[i];
-              var winfo = {name: "", role: "", buttons: [], sheets: 0, groups: 0};
-              try { winfo.name = w.name(); } catch(e) {}
-              try { winfo.role = w.role(); } catch(e) {}
-              try { winfo.buttons = w.buttons().map(function(b) { try { return b.name() || b.description(); } catch(e) { return "?"; } }); } catch(e) {}
-              try { winfo.sheets = w.sheets().length; } catch(e) {}
-              try { winfo.groups = w.groups().length; } catch(e) {}
-              // Check for any static text that might indicate a dialog
-              try {
-                var texts = w.staticTexts();
-                winfo.staticTexts = texts.slice(0, 5).map(function(t) { try { return t.value(); } catch(e) { return "?"; } });
-              } catch(e) {}
-              result.push(winfo);
-            }
-            JSON.stringify(result, null, 2);
-          ' 2>&1 || echo "(UI query failed)"
-
-          # Step 4: Progressive JXA tests — find exactly what hangs
-          echo ""
-          echo "=== Progressive JXA tests (10s timeout each) ==="
-
-          echo -n "Test 1 - app.name(): "
-          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); app.name()'; then
-            echo "OK"
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 2 - app.running(): "
-          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.running())'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 3 - app.activate(): "
-          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); app.activate()'; then
-            echo "OK"
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 4 - count accounts (AppleScript): "
-          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to count accounts'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 5 - app.accounts.length (JXA, no parens): "
-          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.accounts.length)'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 6 - app.accounts() (JXA, full fetch): "
-          if run_with_timeout 10 /usr/bin/osascript -l JavaScript -e 'var app = Application("Notes"); JSON.stringify(app.accounts().length)'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 7 - defaultAccount (AppleScript): "
-          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to get name of default account'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo -n "Test 8 - count notes (AppleScript): "
-          if run_with_timeout 10 /usr/bin/osascript -e 'tell application "Notes" to count notes'; then
-            echo ""
-          else
-            echo "TIMEOUT"
-          fi
-
-          echo ""
-          echo "=== End progressive tests ==="
-          echo "::endgroup::"
+          ' 2>/dev/null || true
 
       - name: Run integration tests
         run: npm run test:integration
